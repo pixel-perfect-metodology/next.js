@@ -1,3 +1,5 @@
+const path = require('path')
+const fs = require('fs-extra')
 const exec = require('./util/exec')
 const logger = require('./util/logger')
 const runConfigs = require('./run')
@@ -25,6 +27,13 @@ if (!allowedActions.has(actionInfo.actionName) && !actionInfo.isRelease) {
 
 ;(async () => {
   try {
+    if (await fs.pathExists(path.join(__dirname, '../SKIP_NEXT_STATS.txt'))) {
+      console.log(
+        'SKIP_NEXT_STATS.txt file present, exiting stats generation..'
+      )
+      process.exit(0)
+    }
+
     const { stdout: gitName } = await exec(
       'git config user.name && git config user.email'
     )
@@ -44,6 +53,12 @@ if (!allowedActions.has(actionInfo.actionName) && !actionInfo.isRelease) {
         `'GITHUB_REF' can not be the same as mainBranch in 'stats-config.js'.\n` +
           `This will result in comparing against the same branch`
       )
+    }
+
+    if (actionInfo.isLocal) {
+      // make sure to use local repo location instead of the
+      // one provided in statsConfig
+      statsConfig.mainRepo = actionInfo.prRepo
     }
 
     // clone main repository/ref

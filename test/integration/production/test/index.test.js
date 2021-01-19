@@ -1,7 +1,7 @@
 /* eslint-env jest */
 /* global browserName */
 import cheerio from 'cheerio'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync } from 'fs'
 import {
   nextServer,
   renderViaHTTP,
@@ -9,6 +9,7 @@ import {
   startApp,
   stopApp,
   waitFor,
+  getPageFileFromPagesManifest,
 } from 'next-test-utils'
 import webdriver from 'next-webdriver'
 import {
@@ -23,7 +24,6 @@ import dynamicImportTests from './dynamic'
 import processEnv from './process-env'
 import security from './security'
 const appDir = join(__dirname, '../')
-let serverDir
 let appPort
 let server
 let app
@@ -32,22 +32,36 @@ jest.setTimeout(1000 * 60 * 5)
 const context = {}
 
 describe('Production Usage', () => {
+  let output = ''
   beforeAll(async () => {
-    await runNextCommand(['build', appDir])
+    const result = await runNextCommand(['build', appDir], {
+      stderr: true,
+      stdout: true,
+    })
 
     app = nextServer({
       dir: join(__dirname, '../'),
       dev: false,
       quiet: true,
     })
+    output = (result.stderr || '') + (result.stdout || '')
+    console.log(output)
+
+    if (result.code !== 0) {
+      throw new Error(`Failed to build, exited with code ${result.code}`)
+    }
 
     server = await startApp(app)
     context.appPort = appPort = server.address().port
-
-    const buildId = readFileSync(join(appDir, '.next/BUILD_ID'), 'utf8')
-    serverDir = join(appDir, '.next/server/static/', buildId, 'pages')
   })
   afterAll(() => stopApp(server))
+
+  it('should contain generated page count in output', async () => {
+    expect(output).toContain('Generating static pages (0/36)')
+    expect(output).toContain('Generating static pages (36/36)')
+    // we should only have 4 segments and the initial message logged out
+    expect(output.match(/Generating static pages/g).length).toBe(5)
+  })
 
   describe('With basic usage', () => {
     it('should render the page', async () => {
@@ -73,8 +87,44 @@ describe('Production Usage', () => {
       })
     }
 
+    it('should polyfill Node.js modules', async () => {
+      const browser = await webdriver(appPort, '/node-browser-polyfills')
+      await browser.waitForCondition('window.didRender')
+
+      const data = await browser
+        .waitForElementByCss('#node-browser-polyfills')
+        .text()
+      const parsedData = JSON.parse(data)
+
+      expect(parsedData.vm).toBe(105)
+      expect(parsedData.hash).toBe(
+        'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9'
+      )
+      expect(parsedData.path).toBe('/hello/world/test.txt')
+      expect(parsedData.buffer).toBe('hello world')
+      expect(parsedData.stream).toBe(true)
+    })
+
     it('should allow etag header support', async () => {
       const url = `http://localhost:${appPort}/`
+      const etag = (await fetch(url)).headers.get('ETag')
+
+      const headers = { 'If-None-Match': etag }
+      const res2 = await fetch(url, { headers })
+      expect(res2.status).toBe(304)
+    })
+
+    it('should allow etag header support with getStaticProps', async () => {
+      const url = `http://localhost:${appPort}/fully-static`
+      const etag = (await fetch(url)).headers.get('ETag')
+
+      const headers = { 'If-None-Match': etag }
+      const res2 = await fetch(url, { headers })
+      expect(res2.status).toBe(304)
+    })
+
+    it('should allow etag header support with getServerSideProps', async () => {
+      const url = `http://localhost:${appPort}/fully-dynamic`
       const etag = (await fetch(url)).headers.get('ETag')
 
       const headers = { 'If-None-Match': etag }
@@ -340,6 +390,31 @@ describe('Production Usage', () => {
       expect(title).toBe('hello from title')
       expect(url).toBe('/with-title')
     })
+
+    it('should reload page successfully (on bad link)', async () => {
+      const browser = await webdriver(appPort, '/to-nonexistent')
+      await browser.eval(function setup() {
+        window.__DATA_BE_GONE = 'true'
+      })
+      await browser.waitForElementByCss('#to-nonexistent-page')
+      await browser.click('#to-nonexistent-page')
+      await browser.waitForElementByCss('.about-page')
+
+      const oldData = await browser.eval(`window.__DATA_BE_GONE`)
+      expect(oldData).toBeFalsy()
+    })
+
+    it('should reload page successfully (on bad data fetch)', async () => {
+      const browser = await webdriver(appPort, '/to-shadowed-page')
+      await browser.eval(function setup() {
+        window.__DATA_BE_GONE = 'true'
+      })
+      await browser.waitForElementByCss('#to-shadowed-page').click()
+      await browser.waitForElementByCss('.about-page')
+
+      const oldData = await browser.eval(`window.__DATA_BE_GONE`)
+      expect(oldData).toBeFalsy()
+    })
   })
 
   it('should navigate to external site and back', async () => {
@@ -357,6 +432,23 @@ describe('Production Usage', () => {
     await waitFor(1000)
     const newText = await browser.elementByCss('p').text()
     expect(newText).toBe('server')
+  })
+
+  it('should navigate to page with CSS and back', async () => {
+    const browser = await webdriver(appPort, '/css-and-back')
+    const initialText = await browser.elementByCss('p').text()
+    expect(initialText).toBe('server')
+
+    await browser
+      .elementByCss('a')
+      .click()
+      .waitForElementByCss('input')
+      .back()
+      .waitForElementByCss('p')
+
+    await waitFor(1000)
+    const newText = await browser.elementByCss('p').text()
+    expect(newText).toBe('client')
   })
 
   it('should navigate to external site and back (with query)', async () => {
@@ -635,24 +727,27 @@ describe('Production Usage', () => {
   })
 
   it('should handle failed param decoding', async () => {
-    const html = await renderViaHTTP(appPort, '/%DE~%C7%1fY/')
+    const html = await renderViaHTTP(appPort, '/invalid-param/%DE~%C7%1fY/')
     expect(html).toMatch(/400/)
     expect(html).toMatch(/Bad Request/)
   })
 
   it('should replace static pages with HTML files', async () => {
-    const staticFiles = ['about', 'another', 'counter', 'dynamic', 'prefetch']
-    for (const file of staticFiles) {
-      expect(existsSync(join(serverDir, file + '.html'))).toBe(true)
-      expect(existsSync(join(serverDir, file + '.js'))).toBe(false)
+    const pages = ['/about', '/another', '/counter', '/dynamic', '/prefetch']
+    for (const page of pages) {
+      const file = getPageFileFromPagesManifest(appDir, page)
+
+      expect(file.endsWith('.html')).toBe(true)
     }
   })
 
   it('should not replace non-static pages with HTML files', async () => {
-    const nonStaticFiles = ['api', 'external-and-back', 'finish-response']
-    for (const file of nonStaticFiles) {
-      expect(existsSync(join(serverDir, file + '.js'))).toBe(true)
-      expect(existsSync(join(serverDir, file + '.html'))).toBe(false)
+    const pages = ['/api', '/external-and-back', '/finish-response']
+
+    for (const page of pages) {
+      const file = getPageFileFromPagesManifest(appDir, page)
+
+      expect(file.endsWith('.js')).toBe(true)
     }
   })
 
